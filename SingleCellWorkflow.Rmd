@@ -1,0 +1,345 @@
+---
+title: "SingleCellWorkflow"
+author: "MSK"
+date: "2024-05-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# load libraries
+library(Seurat)
+library(ggplot2)
+library(tidyverse)
+library(gridExtra)
+library(cowplot)
+```
+
+### Before beginning
+
+I use this Markdown to perform the standard analysis of single cell RNA sequencing using Seurat package and to integrate different datasets into single analysis using Harmony. In other markdown, I will try different methods of data integration to compare their results. Many thanks to Seurat tutorials that are well documented and very helpful tutorials of Khushbu Patel. 
+
+Dataset is from GSE180665 that contains scRNA-seq of 3 Hepatoblastoma (HB) patients. The details of dataset could be found in https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE180665
+
+I have set eval = FALSE for most of chunks to prevent running all Markdown since some steps take lot of time to run. However, this Markdown has been run and related results have been saved and reloaded to only display relevant results for better understanding. THINK to use parallelization tools for future version. 
+
+### Step 1. Create a Seurat object
+Detected genes are summarized automatically when creating the Seurat object: nFeature_RNA is the number of detected genes/features; nCount_RNA is the number of detected transcripts.
+
+```{r Seurat_obj, eval=FALSE}
+# Not execute this chunk to save time => load pre-created seurat object
+# get data location
+dirs <- list.dirs(path = 'data/', recursive = F, full.names = F)
+
+for(x in dirs){
+  # get basename of samples
+  name <- gsub('_filtered_feature_bc_matrix','', x)
+  
+  cts <- ReadMtx(mtx = paste0('data/',x,'/matrix.mtx.gz'),
+                 features = paste0('data/',x,'/features.tsv.gz'),
+                 cells = paste0('data/',x,'/barcodes.tsv.gz'))
+  
+  # using the value of name to create seurat objects 
+  assign(name, CreateSeuratObject(counts = cts))
+}
+
+# list what we have in the current work directory
+ls()
+
+# merge all seurat datasets to an unique dataset ----
+merged_seurat <- merge(HB17_background, y = c(HB17_PDX, HB17_tumor, HB30_PDX, HB30_tumor, HB53_background,
+                                              HB53_tumor),
+                       # this allows to know which barcodes from which sample, cell.id should match with seurat sample
+                       add.cell.ids = ls()[3:9],
+                       project = 'HB')
+
+merged_seurat
+
+# View(merged_seurat@meta.data)
+
+# create a sample column
+merged_seurat$sample <- rownames(merged_seurat@meta.data)
+
+# split sample column
+merged_seurat@meta.data <- separate(merged_seurat@meta.data, col = 'sample', into = c('Patient', 'Type', 'Barcode'),
+                                    sep = '_')
+
+# SAVE merged_seurat for further analysis 
+# use saveRDS/readRDS to save/load every Seurat object separately
+if(!dir.exists('export')){dir.create('export')}
+saveRDS(merged_seurat, file='export/merged_seurat.rds')
+
+# # or use save/load to save multiple objects together 
+# save(seurat_obj1, seurat_obj2, file="export/seurat_objs.rdata")
+# load("export/seurat_objs.rdata")
+
+```
+
+
+```{r load_seuratobject}
+merged_seurat <- readRDS('export/merged_seurat.rds')
+```
+
+
+### Step 2. Quality control
+The most common quality control is to filter out:
+
+1. Cells with too few genes detected. They usually represent cells which are not sequenced deep enough for reliable characterization.
+2. Cells with too many genes detected. They may represent two or more cells in the same droplet, therefore sharing the same cell barcode.
+3. Cells with high mitochondrial transcript percentage, indicating cells under stress (e.g. hypoxia) which produce a lot of mitochondria, or which produce an abnormally high amount of truncated mitochondrial transcripts.
+
+Unfortunately, there are NO standard filtering criteria. One suggestion here is to ONLY FILTER OUT OUTLIER CELLS, i.e. the minority of cells with certain QC metrics clearly above or below the majority of cells. To do that, one needs to first know how these values are distributed in the data. One can look at the distribution by creating a violin plot for each of the metrics.
+
+```{r QC, fig.width=10}
+# calculate mitochondrial percentage
+merged_seurat$mito_Percent <- PercentageFeatureSet(merged_seurat, pattern='^MT-')
+
+# QC visualization
+# VlnPlot(merged_seurat, features = c("nFeature_RNA", "nCount_RNA", "mito_Percent"), ncol = 3)
+
+VlnPlot(merged_seurat, features = c("nFeature_RNA", "nCount_RNA", "mito_Percent"), ncol = 3, pt.size=0) # wihtout points
+
+```
+
+As we would expect, number of detected genes and number of detected transcripts are well correlated across cells while mitochondrial transcript percentage is not.
+
+```{r, fig.width=10}
+library(patchwork)
+
+plot1 <- FeatureScatter(merged_seurat, feature1 = "nCount_RNA", feature2 = "mito_Percent")
+plot2 <- FeatureScatter(merged_seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+Due to the correlation of gene number and transcript number, we only need to set a cutoff to either one of these metrics, combined with an upper threshold of mitochondrial transcript percentage, for the QC. For instance, for this data set, a detected gene number between 500 and 8000, and a mitochondrial transcript percentage lower than 10% would be quite reasonable, but it is fine to use different thresholds.
+
+Idea: filter out the cells with high gene number, ex: greater than 8000 and compare the expression House Keeper genes with the cells having normal gene numbers (between 500 and 8000). 
+
+```{r, eval=FALSE}
+# filtering as mentioned in the publication
+merged_seurat_filtered <- subset(merged_seurat, subset = nFeature_RNA > 500 & nFeature_RNA < 8000 & mito_Percent < 10)
+
+merged_seurat # 3538 features across 77936 samples within 1 assay
+merged_seurat_filtered # 33538 features across 68177 samples within 1 assay (remove 77936-68177 = 9759 cells)
+
+```
+Sometimes more QC may need to be applied. One potential issue is the presence of doublets. As the amount of captured RNA varies a lot from cell to cell, doublets don't always show a higher number of detected genes or transcripts. There are several tools available now, which are designed to predict whether a 'cell' is indeed a singlet or actually a doublet/multiplet. DoubletFinder, for instance, predicts doublets by first constructing artificial doublets by randomly averaging cells in the data, and then for each cell testing whether it is more similar to the artificially doublets or not. This helps with the decision whether a cell is likely a doublet or not. Similarly, mitochondrial transcript percentage may not be sufficient to filter out stressed or unhealthy cells. Sometimes one would needs to do extra filtering, e.g. based on the machine learning based prediction.##
+
+### Step 3. Normalization
+
+A normalization step, aiming to make gene expression levels between different cells comparable, is therefore necessary. The most commonly used normalization in scRNA-seq data analysis is very similar to the concept of TPM (Transcripts Per Million reads) - one normalizes the feature expression measurements for each cell to the total expression, and then multiplies this by a scale factor (10000 by default). At the end, the resulting expression levels are log-transformed so that the expression values better fit a normal distribution. 
+
+```{r normalization, eval=FALSE}
+# normalized data is stored in data slot
+merged_seurat_filtered <- NormalizeData(object = merged_seurat_filtered)
+```
+
+Step 4. Feature selection
+
+This step usually aims to the identification of highly variable features/genes, which are genes with the most varied expression levels across cells.
+
+Parameter options : selection.method and nfeatures, allowing to determine the methods (vst, mvp, disp) and fix the top numbers of Variable Features (ex: nfeatures = 2000 by default, top 2000 ones as the highly variable features) 
+```{r, eval=FALSE}
+# 
+merged_seurat_filtered <- FindVariableFeatures(object = merged_seurat_filtered, selection.method = "vst", nfeatures = 3000)
+
+```
+
+```{r}
+# Load merged_seurat_filtered for further analysis or visualization
+merged_seurat_filtered <- readRDS('export/merged_seurat_filtered.rds')
+```
+
+
+Visualization of the result in a variable feature plot: variable features are shown by red points.
+```{r, fig.width=10}
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(merged_seurat_filtered), 10)
+
+plot1 <- VariableFeaturePlot(merged_seurat_filtered)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE, xnudge = 0, ynudge = 0)
+plot1 + plot2
+```
+
+### Step 5. Data scaling
+
+Since different genes have different base expression levels and distributions, the contribution of each gene to the analysis is different if no data transformation is performed. It's recommended to do scaling before data analysis, as we don't want that our analysis only depends on genes that are highly expressed.
+
+```{r, eval=FALSE}
+# scale data is stored in scale.data slot
+merged_seurat_filtered <- ScaleData(object = merged_seurat_filtered)
+```
+(Optional and advanced) Alternative step 3-5: using SCTransform
+log-normalization introduces the zero-inflation artifact into the scRNA-seq data. To better resolve this issue, Hafemeister and Satija introduced an R package sctransform, which uses a regularized negative binomial regression model to normalize scRNA-seq data. Seurat has a wrapper function SCTransform. FOR NEXT ANALYSIS. 
+
+### Step 6. Linear dimensionality reduction using PCA
+
+Applying a linear dimension reduction before doing any further analysis is strongly recommended and sometimes even seen as mandatory. The advantage of doing a dimension reduction includes but is not limited to:
+
+1. The data becomes much more compact so that computation becomes much faster.
+2. As scRNA-seq data is intrinsically sparse, summarizing measurements of related features greatly enhances the signal robustness.
+
+A potential drawback maybe that one needs to perform extra analyses to decide on the number of reduced dimensions to use in the following analysis.
+
+Seurat uses truncated PCA to only calculate the first PCs instead of calculating all possible PCs, by default the top 50 PCs. The npcs parameter is used to change ths number.
+
+```{r, eval=FALSE}
+merged_seurat_filtered <- RunPCA(object = merged_seurat_filtered, npcs = 50)
+```
+
+```{r, eval=FALSE}
+# get the top5 features of first 5 principal components
+print(merged_seurat_filtered[["pca"]], dims = 1:5, nfeatures = 5)
+# visualize PCA results
+DimHeatmap(merged_seurat_filtered, dims = 1:20, cells = 500, balanced = TRUE, ncol = 4)
+
+```
+
+
+Determinating dimensionality of the data (the numbers of components to take) using Elbowplot, plotting the explained variation as a function of each PC, and picking the elbow of the curve as the number of PCs to use.
+
+```{r}
+ElbowPlot(merged_seurat_filtered, ndims = 50, reduction = "pca")
+# ElbowPlot(merged_seurat_filtered, ndims = ncol(Embeddings(merged_seurat_filtered, "pca")))
+```
+The curve of the elbow plot drops dramatically for the first few PCs, and then slows down and becomes pretty flat. One would assume that the first phase of the curve represents the 'real' signal related to biological differences between cell populations, while the second phase mostly represents technical variation or the stochastic nature of individual cells. To that perspective, choosing the top-15 PCs is probably good and PCs ranked lower than 20 look quite unnecessary. Here, we would use the top-20 PCs for the following analysis. 
+
+## Step 7. Non-linear dimension reduction for visualization
+
+A linear dimension reduction usually needs more than 10 PCs to cover most of the information. It is impossible to visualize more than three dimensions. Therefore, non-linear dimension reductions is introduced to overcome this issue. The most commonly used non-linear dimension reduction methods in scRNA-seq data analysis are t-distributed Stochastic Neighbor Embedding (t-SNE) and Uniform Manifold Approximation and Projection (UMAP). Both methods try to place every sample in a low-dimensional space (2D/3D), so that distances or neighborhood relationships between different samples (here cells) in the original space are largely retained in the low-dimensional space.
+
+Please note that there are more methods to create other low-dimensional embeddings for visualization, including but not limiting to SPRING, PHATE. Let's focus on t-SNE and UMAP here. The top PCs in the PCA analysis are used as the input to create a t-SNE and UMAP embedding of the data.
+
+```{r, eval=FALSE}
+# this takes lot of time
+merged_seurat_filtered <- RunTSNE(merged_seurat_filtered, dims = 1:20)
+merged_seurat_filtered <- RunUMAP(merged_seurat_filtered, dims = 1:20)
+
+saveRDS(merged_seurat_filtered, file='export/merged_seurat_filtered.rds')
+
+```
+
+
+```{r, fig.align='center', fig.cap='UMAP and t-SNE figures based on patients and types', fig.width=10,fig.height=10}
+# plot
+p1 <- DimPlot(merged_seurat_filtered, reduction = 'umap', group.by = 'Patient')
+p2 <- DimPlot(merged_seurat_filtered, reduction = 'umap', group.by = 'Type',
+              cols = c('red','green','blue'))
+
+p3 <- DimPlot(merged_seurat_filtered, reduction = 'tsne', group.by = 'Patient')
+p4 <- DimPlot(merged_seurat_filtered, reduction = 'tsne', group.by = 'Type',
+              cols = c('red','green','blue'))
+
+grid.arrange(p1, p2, p3, p4, ncol = 2, nrow = 2)
+
+```
+
+As shown, the cells are clustered according to patients and tissue type but not according to biology (cell types), meaning that there are bias from experimental issues. Thus, it needs to perform data integration to correct these batch effects (in next Markdown). 
+
+### Step 8. Data integration
+
+Like dealing with bulk RNA-seq data, batch effect is usually a critical confounder of the result that one has to resolve. Please be aware that there is no 'best' integration method for all scenarios. It is therefore important to try different methods and compare, to at the end choose the one that works the best for every specific case.
+
+There are different methods, including but not limiting canonical correlation analaysis (CCA) built in Seurat package, Harmony, LIGER, MNN, RSS to BrainSpan CSS, Scmap, Scanorma and scAlign. Here I will use only Harmony to verify if the batch effects could be corrected after data integration. 
+ 
+#### Data integration using Harmony
+
+Harmony (https://github.com/immunogenomics/harmony), an algorithm that projects cells into a shared embedding in which cells group by cell type rather than dataset-specific conditions. 
+
+Harmony provides a simple API for Seurat object, which is a function called RunHarmony, so it is very easy to use. It takes the merged Seurat object (the one generated at Step 1) as the input and one needs to tell the function which metadata feature to use as the batch identity. It returns a Seurat object, with a more reduction called harmony added. It is like the corrected PCA, so one should then explicitly tell Seurat to use the harmony reduction for following analysis including making UMAP embedding and identifying cell clusters.
+
+Note: By default, the harmony API works on Seurats PCA cell embeddings and corrects them. Harmony is much faster compared to Seurat (CCA).
+
+```{r, eval=FALSE}
+# Note: FindVariableFeatures, scaleData, RnuPCA should be performed before proceeding to RunHarmony
+# seurat <- merge(merged_seurat_filtered) %>%
+#     FindVariableFeatures(nfeatures = 3000) %>%
+#     ScaleData() %>%
+#     RunPCA(npcs = 50)
+
+seurat <- readRDS('export/merged_seurat_filtered.rds')
+
+library(harmony)
+seurat <- RunHarmony(seurat, group.by.vars = "Patient", dims.use = 1:20, max.iter.harmony = 50)
+seurat <- RunUMAP(seurat, reduction = "harmony", dims = 1:20)
+
+# save the object
+saveRDS(seurat, file='export/integrated_harmony.rds')
+
+```
+
+
+```{r, fig.align='center', fig.cap='UMAP based on patients and types before (up) and after (botom) harmony data integration', fig.width=10,fig.height=10}
+seurat_harmony <- readRDS('export/integrated_harmony.rds')
+
+# # to see different reductions already applied to seurat objects
+# seurat_harmony@reductions
+# # to get Harmony embedding values
+# harmony_embed <- Embeddings(seurat_harmony, 'harmony')
+
+# DimPlot will takes Harmony embedding value to perform UMAP (because of RunUMAP(seurat, reduction = "harmony", dims = 1:20) in line 264
+p5 <- DimPlot(seurat_harmony, reduction = 'umap', group.by = 'Patient')
+p6 <- DimPlot(seurat_harmony, reduction = 'umap', group.by = 'Type',
+              cols = c('red','green','blue'))
+
+cowplot::plot_grid(p1, p2, p5, p6, ncol = 2, nrow = 2, labels = c("Before-patient", "Before-type", "After-patient", "After-type"))
+
+```
+
+Cells from 3 patients (and from tissue types) are mixed in different clusters after data integration (in bottom panel) compared to the UMAP before (in top panel). It is not perfect but it does help to make these data sets more comparable.
+
+
+### Step 9. Cluster the cells using data corrected by Harmony
+
+Seurat uses Shared Nearest Neighbor (SNN) network to identify cell groups. The behind idea is that cells in the same group tend to connect with each other, while connections between cells in different groups are sparse.
+
+First of all, a k-nearest neighbor network of cells is generated. Every cells is firstly connected to cells with the shortest distances, based on their corresponding PC values. Only cell pairs which are neighbors of each other are considered as connected. Proportion of shared neighbors between every cell pairs is then calculated and used to describe the strength of the connection between two cells. Weak connections are trimmed.
+
+#### Determine the resolution
+
+The resolution parameter (common ranges between 0.1 and 1) is used to control whether the major cell groups (major cell types), or the smaller but finer cell groups are returned (cell subtypes). The best option depends on the aim of the analysis. By increasing the resolution, the number of cluster will be higher (to get finer clustering).
+
+We can run multiple times of the FindClusters function with different resolutions to determine the most relevant resolution. The newest clustering result can be obtained by Idents(seurat) or seurat@active.ident. Other clustering results are also stored as different columns in the meta.data slot (seurat@meta.data).
+
+```{r}
+# testing different resolutions
+seurat_harmony <- FindNeighbors(seurat_harmony, reduction = "harmony", dims = 1:20) %>% 
+  FindClusters(resolution = c(0.1, 0.2, 0.3, 0.6)) 
+```
+
+Here, the resolution 0.2 seems sufficient to generate 16 clusters without too much overlapped.
+
+```{r, fig.align='center', fig.cap='UMAP of Harmony based on integrated data based on resolutions', fig.width=10,fig.height=10}
+
+plot_res0.1 <- DimPlot(seurat_harmony, group.by = "RNA_snn_res.0.1", label = TRUE) # 11 clusters 
+plot_res0.2 <- DimPlot(seurat_harmony, group.by = "RNA_snn_res.0.2", label = TRUE) # 16 clusters, sufficient
+plot_res0.3 <- DimPlot(seurat_harmony, group.by = "RNA_snn_res.0.3", label = TRUE) # 19 clusters, more subtypes
+plot_res0.6 <- DimPlot(seurat_harmony, group.by = "RNA_snn_res.0.6", label = TRUE) # 22 clusters, more subtypes overlapped clusters
+
+grid.arrange(plot_res0.1, plot_res0.2, plot_res0.3, plot_res0.6, ncol = 2, nrow = 2)
+
+# # to check current identity of clusters 
+# Idents(seurat_harmony)
+# setting identity of clusters
+Idents(seurat_harmony) <- "RNA_snn_res.0.2"
+
+```
+
+#### Clustering using determined resolution
+
+```{r}
+seurat_harmony <- FindClusters(seurat_harmony, resolution = 0.2)
+
+```
+
+Next is to visualize the clustering result using UMAP based on Harmony embeddings with resolution equals to 0.2. 
+
+```{r, fig.cap='UMAP based on harmony data with 0.2 resolution'}
+DimPlot(seurat_harmony, reduction = 'umap', label = TRUE)
+```
+
+16 clusters have been obtained with 0.2 resolution. What are the cell types or cell states these that cell clusters are representing ? This is what we call "Annotating cell clusters" and will be the topic of another Markdown. There are several options that helps us to annotate cell clusters. For instance,
+
+1. Check the expression of canonical cell type and cell state markers in these clusters.
+2. Identify marker genes of each identified cell cluster. Based on the identified cluster marker genes, one can do literature search, enrichment analysis or do experiment for annotation.
+3. For each cluster, compare its gene expression profile with existing reference data.
