@@ -1,0 +1,329 @@
+---
+title: "Annotation of cell clusters"
+author: "MSK"
+date: "2024-05-19"
+output: html_document
+---
+
+
+### Preamble before Annotate cell clusters (several chunks below)
+
+Previously, I have obtained 16 clusters, it's time to know which cell types that they represent. However, I use only 1 patient with TUMOR to test different methods of cluster annotation in this Markdown (due to the modest performance of my computer). 
+
+Please be aware, that while the tSNE/UMAP embedding and clustering should be done with the integrated assay, the corrected values from integrated are no longer very reliable as the quantitative measure of gene expression. It is recommended to use the uncorrected expression values to perform other analysis such as cluster marker identification.
+
+Note: I have tried initially to perform cluster marker identification using integrated data, I got no DE genes.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# load libraries
+library(Seurat)
+library(SingleR)
+library(celldex)
+library(tidyverse)
+library(pheatmap)
+library(patchwork)
+
+```
+
+### Create a Seurat object & perform QC, filter, Normalization, Scale and PCA
+
+```{r, eval=FALSE}
+cts <- ReadMtx(mtx = paste0('data/HB17_tumor_filtered_feature_bc_matrix/matrix.mtx.gz'),
+               features = paste0('data/HB17_tumor_filtered_feature_bc_matrix/features.tsv.gz'),
+               cells = paste0('data/HB17_tumor_filtered_feature_bc_matrix/barcodes.tsv.gz'))
+
+seurat_tumor <- CreateSeuratObject(counts = cts, project = "HB17")
+
+# QC and filter
+seurat_tumor$mito_Percent <- PercentageFeatureSet(seurat_tumor, pattern='^MT-')
+seurat_tumor_filtered <- subset(seurat_tumor, subset = nFeature_RNA > 500 & nFeature_RNA < 8000 & mito_Percent < 5)
+seurat_tumor_filtered # 33538 features across 7930 samples within 1 assay (ori: 7995 cells)
+
+# normalized data is stored in data slot
+seurat_tumor_filtered <- NormalizeData(object = seurat_tumor_filtered)
+# Feature selection
+seurat_tumor_filtered <- FindVariableFeatures(object = seurat_tumor_filtered, 
+                                              selection.method = "vst", nfeatures = 3000)
+# scale data is stored in scale.data slot
+seurat_tumor_filtered <- ScaleData(object = seurat_tumor_filtered)
+# Linear dimensionality reduction using PCA
+seurat_tumor_filtered <- RunPCA(object = seurat_tumor_filtered, npcs = 50)
+
+# ElbowPlot(seurat_tumor_filtered, ndims = 50, reduction = "pca")
+seurat_tumor_filtered <- RunUMAP(seurat_tumor_filtered, dims = 1:20)
+
+```
+
+### Cluster the cells
+
+The more commonly used clustering methods in scRNA-seq data analysis is graph-based community identification algorithm. In seurat, the "FindNeighbors" function produces Shared Nearest Neighbor (SNN) network, including following steps : a k-nearest neighbor network of cells is firstly generated, proportion of shared neighbors between every cell pairs is then calculated to represent the strength of the connection between two cells. Weak connections are trimmed to result in SNN network.
+
+The Louvain community identification algorithm is then applied to the network, via "FindClusters" function, to look for communities in the network, i.e. cell groups that cells in the same group tend to connect with each other, while connections between cells in different groups are sparse. The parameter "resolution" is used to control the fitness of cell types, (e.g. major cell types with small resolution or sub cell types with bigger resolution).
+
+Please note that Traag et al. reported that the Louvain-based calculations resulted in poorly connected (25%) or even disconnected (16%) communities [Sci Rep. 2019; 9: 5233]. Thus, the Leiden algorithm was successively introduced, guaranteeing intercommunity connections while increasing the clustering speed.
+
+```{r, eval=FALSE}
+
+seurat_tumor_filtered <- FindNeighbors(seurat_tumor_filtered, dims = 1:20)
+seurat_tumor_filtered <- FindClusters(seurat_tumor_filtered, resolution = 0.6) 
+
+# seurat_tumor_filtered <- FindClusters(seurat_tumor_filtered, resolution = c(0.2, 0.6, 1)) 
+# plot_res0.2 <- DimPlot(seurat_tumor_filtered, group.by = "RNA_snn_res.0.2", label = TRUE) # 9 clusters
+# plot_res0.6 <- DimPlot(seurat_tumor_filtered, group.by = "RNA_snn_res.0.6", label = TRUE) # 12 clusters
+# plot_res1 <- DimPlot(seurat_tumor_filtered, group.by = "RNA_snn_res.1", label = TRUE) # 13 clusters
+# grid.arrange(plot_res0.2, plot_res0.6, plot_res1, ncol = 2, nrow = 2)
+
+# SAVE
+saveRDS(seurat_tumor_filtered, file='export/HB17_tumor_seurat_filtered.rds')
+
+```
+
+
+```{r, fig.width=8}
+# Load seurat_tumor_filtered for further analysis or visualization
+seurat_tumor_filtered <- readRDS('export/HB17_tumor_seurat_filtered.rds')
+DimPlot(seurat_tumor_filtered, reduction = 'umap', label = TRUE)
+```
+
+### Automatic cell-annotation using SingleR based on reference data
+
+Using default mode of SingleR with HumanPrimaryCellAtlasData (containing 36 cell types) as reference, singleR tries to correlate the each unannotated cell to each cell type in the reference to annotate each single cell in the query.
+
+The choice of reference is very important for the reference-based automatic annotation tools, such as SingleR that does not allow to none labeled cluster. This means that SingleR returns annotation to every cluster even through the correlations of  between the cell types of reference and the cell types of clusters to define are very poor. SingleR returns the cell type of the best score (even very bad correlation) as its cell type annotation. "None" labels are allowed for other reference-based automatic annotation tools, such as scmap-cluster and scmap-cell. Thinking for the future tests.
+
+<!-- Question to myself: celldex contains 7 reference data, could I combine several of them to perform annotation ? -->
+
+```{r, eval=FALSE}
+# get reference data -----------
+hpca <- celldex::HumanPrimaryCellAtlasData()
+View(as.data.frame(colData(hpca)))
+# expression values are log counts (log normalized counts)
+
+# run SingleR (default mode) ---------
+# default for SingleR is to perform annotation of each individual cell in the test dataset
+
+tumor_counts <- GetAssayData(seurat_tumor_filtered, slot = 'counts')
+
+pred_SingleR <- SingleR(test = tumor_counts,
+        ref = hpca,
+        labels = hpca$label.main)
+
+write.csv(pred_SingleR, file = "export/HB17_tumor_SingleR_hpca.csv")
+
+```
+
+```{r}
+pred <- read.csv("export/HB17_tumor_SingleR_hpca.csv", row.names = 1)
+table(pred$labels) # 7051 Hepatocytes/ 7930 cells => logical but not useful 
+
+# hist(pred$scores)
+```
+
+Using HumanPrimaryCellAtlasData, singleR annotates 7051 cells among 7930 cells as Hepatocytes. This is logical but not very useful. By taking a look of Score results (pred$scores), we can see the most of scores are less than 0.3 (98.85%). HumanPrimaryCellAtlasData is not good reference for this case. Unfortunately, I did not find a better reference from celldex package, containing essentially the references of immune cells. SHOULD check if it is possible for singleR to use customized reference. It's interesting to know what are the scores when using good reference to annotate cells, i.e. using the reference of immune cells to annotate single cells data from PBMC.
+
+```{r, eval=FALSE}
+# merge only seurat datasets from HB17 to an unique dataset (to reduce computation resource) ----
+tumor_merged_seurat <- merge(HB17_tumor, y = c(HB30_tumor, HB53_tumor),
+                       # this allows to know which barcodes from which sample, cell.id should match with seurat sample
+                       add.cell.ids = c("HB17_tumor", "HB30_tumor", "HB53_tumor"),
+                       project = 'tumor')
+
+merged_seurat # 33538 features across 27219 samples within 1 assaywith 3 layers
+# create a sample column in metadata
+merged_seurat$sample <- rownames(merged_seurat@meta.data)
+```
+
+
+### Marker-based cell annotation
+#### Find markers and cluster identification using Seurat
+
+FindAllMarkers function is used to find DE genes of each cluster compared to all other clusters. Several statistical tests are available using "test.use" parameter : wilcox (default in seurat v5 using a fast implementation by Presto), bimod, roc, t (Student's t-test), negbinom, poisson (use oor UMI-based datasets), LR (logistic regression), MAST (using a hurdle model tailored to scRNA-seq data to identify DE genes between 2 groups of cells) and DESeq2. Different options are also included, such as logfc.threshold, min.pct, only.pos. Please read the related document for more information. 
+
+#### FindAllMarkers using DESeq2
+
+```{r}
+
+# cl_markers <- FindAllMarkers(seurat_tumor_filtered, 
+#                              only.pos = TRUE, # only look at up-regulated genes
+#                              min.pct = 0.2, # only compare genes that express in at least 20% fraction in either of the two populations
+#                              logfc.threshold = log(1.2),
+#                              test.use = 'DESeq2',
+#                              slot = 'counts') # 6371    7
+# 
+# # SAVE cl_markers
+# write.csv(cl_markers, file = "export/HB17_tumor_cluster_markers.csv")
+
+cl_markers <- read.csv("export/HB17_tumor_cluster_markers.csv", row.names = 1)
+table(cl_markers$cluster) # not found marker genes for cluster 0, 1, 3, 5-7
+
+```
+
+No identified DE genes for some clusters (cluster 0, 1, 3, 5-7). In the fig 1, there is a huge cluster composed of cluster0 to 7 and only cluster 2 and cluster 4 have identified marker genes using FindAllMarkers function. Be aware that several parameters could be modified to refine the analysis, such as min.pct and test.use. Only up-regulated DE genes have been found Since only.pos = TRUE, down-regulated DE should also be investigated. 
+
+To visualize the top 5 DE genes per cluster using DESeq2:
+
+```{r}
+library(dplyr)
+cl_markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+
+```
+
+
+##### Gene Ontology Enrichment of identified DE genes (DESEQ2)
+
+```{r}
+# keep the most significant DE genes for GO Enrichment Analysis
+sig_cl_markers <- cl_markers %>% filter(avg_log2FC > 0.5 & pct.1 > 0.5 & p_val_adj < 0.05) # # 1032 7
+table(sig_cl_markers$cluster) # 1032 7
+
+```
+
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+sig_cl_markers <- sig_cl_markers %>%
+  rowwise() %>%
+  mutate(cluster_name = paste("cluster", cluster, sep = "_"))
+
+sig_cl_markers$cluster_name <- factor(sig_cl_markers$cluster_name, 
+                                      levels = c('cluster_2',  'cluster_4', 'cluster_8',  'cluster_9', 
+                                                 'cluster_10', 'cluster_11'))
+# Split the dataframe into a list of subsets according to cluster
+deg_results_list <- split(sig_cl_markers, sig_cl_markers$cluster_name)
+
+# Run enrichGO on each sub-dataframe
+res <- lapply(names(deg_results_list),
+              function(x) enrichGO(gene = deg_results_list[[x]]$gene,
+                                   OrgDb = "org.Hs.eg.db", keyType = "SYMBOL", ont = "BP")) # entichGO will keep only padj < 0.05
+names(res) <- names(deg_results_list)
+```
+
+##### GO enrichment of up-regulated genes (DESeq2)
+
+```{r, fig.align='center', fig.width=8, fig.height=8}
+
+lapply(names(res),
+       function(x){barplot(res[[x]], showCategory = 20) + ggtitle(x)}
+       )
+
+```
+
+cluster_2 : essentially RNA spicing, protein folding => increasing transcription and translation activities
+
+cluster_4 contains essentially genes that are involved in metabolism, glucose and fatty acid, one of main functions of hepatocytes. 
+
+cluster_8 : regulation of angiogenesis, epithelial cell migration, cell-matrix adhesion => tumor metastasis ? 
+
+cluster_9 : regulation of cell shape, morphogenesis, actin filament polymerization
+
+cluster_10 : cell-matrix adhesion, eye development, pigmenttion => which cell types ?
+
+cluster_11 : Immune cells (T cell proliferation)
+
+#### FindAllMarkers using Wilcox
+
+With Wilcox test and not limiting to positive markers, more DE genes are identified for every cluster.
+
+
+```{r}
+# # FindAllMarkers with other parameters
+# cl_markers_wx <- FindAllMarkers(seurat_tumor_filtered,
+#                              only.pos = FALSE,
+#                              min.pct = 0.1, #
+#                              logfc.threshold = 0.2,
+#                              test.use = 'wilcox',
+#                              slot = 'data')
+# 
+# # SAVE cl_markers
+# write.csv(cl_markers_wx, file = "export/HB17_tumor_cluster_markers_wilcox.csv")
+
+cl_markers_wx <- read.csv("export/HB17_tumor_cluster_markers_wilcox.csv", row.names = 1)
+
+table(cl_markers_wx$cluster)
+```
+
+To visualize the top 5 DE genes per cluster using Wilcox test:
+
+```{r}
+cl_markers_wx %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+```
+
+
+```{r, fig.width=10, fig.height=10}
+top10_cl_markers <- cl_markers_wx %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+DoHeatmap(seurat_tumor_filtered, features = top10_cl_markers$gene) + NoLegend()
+```
+
+##### Gene Ontology Enrichment of identified DE genes (Wilcox)
+
+```{r}
+# keep the most significant DE genes for GO Enrichment Analysis
+sig_cl_markers_wx <- cl_markers_wx %>% filter(avg_log2FC > 0.7 & pct.1 > 0.5 & p_val_adj < 0.05) # 2365 7
+table(sig_cl_markers_wx$cluster) 
+
+```
+
+
+```{r}
+# no GO enrichments for cluster 0 and 6 => remove cluster 0 and cluster 6 to gain computing time
+sig_cl_markers_wx <- sig_cl_markers_wx %>%
+  dplyr::filter(!cluster %in% c(0, 6)) %>%
+  rowwise() %>%
+  mutate(cluster_name = paste("cluster", cluster, sep = "_")) %>%
+  mutate_at(vars(cluster_name), factor, levels = c('cluster_1', 'cluster_2','cluster_3', 'cluster_4',
+                                                   'cluster_5', 'cluster_7', 'cluster_8', 'cluster_9',
+                                                   'cluster_10', 'cluster_11'))
+
+
+# Split the dataframe into a list of subsets according to cluster
+deg_results_list <- split(sig_cl_markers_wx, sig_cl_markers_wx$cluster_name)
+
+# Run enrichGO on each sub-dataframe
+res <- lapply(names(deg_results_list),
+              function(x){y <- enrichGO(gene = deg_results_list[[x]]$gene,
+                                         OrgDb = "org.Hs.eg.db", keyType = "SYMBOL", ont = "BP")
+              return(y)
+              } ) # entichGO will keep only padj < 0.05
+
+names(res) <- names(deg_results_list)
+
+```
+
+##### GO enrichment of up-regulated genes (Wilcox)
+
+```{r, fig.align='center', fig.width=8, fig.height=8}
+
+lapply(names(res),
+       function(x){barplot(res[[x]], showCategory = 20) + ggtitle(x)}
+       )
+
+```
+
+cluster_1 : DNA replication, nuclear division, chromosome segregation, cell cycle checkpoint signaling => cell division, cell cycles, involved in tumor growth ?
+
+cluster_2 : essentially chaperone-mediated protein folding, protein folding, regulation of protein stability, positive regulation of telomerase activity => increasing translation activities
+
+cluster_3 : cytoplasmic translation, ribosome biogenesis => ncreasing transcription and translation activities, negative regulation of ubiquitin-protein transferase activity
+
+cluster_4 contains essentially genes that are involved in metabolism, glucose and fatty acid, one of main functions of hepatocytes. 
+
+cluster_5 : essentially Wnt signaling pathway (with p.ajust values are not very significant, around 0.025-0.04)
+
+cluster_7 : regulation of cell morphogenesis, regulation of developmental growth, neuron migration, cardiac chamber morphogenesis => which cell types ?
+
+cluster_8 : regulation of angiogenesis & vasculature, epithelial cell migration, tissue migration, cell-matrix adhesion => tumor metastasis ? 
+
+cluster_9 : regulation of cell shape, morphogenesis, actin filament polymerization
+
+cluster_10 : cell-matrix adhesion, extra-cellular matrix or structure organization, epithelial cell development => pre-tumor cells ?
+
+cluster_11 : Immune cells (T cell regulation, Lymphocyte proliferation)
+
+
+In general manner, similar results of GO enrichment (when applicable) are obtained using DE genes identified using DESeq2 and using Wilcox test.
